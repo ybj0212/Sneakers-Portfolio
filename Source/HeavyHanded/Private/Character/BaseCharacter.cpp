@@ -1,0 +1,1357 @@
+﻿// Fill out your copyright notice in the Description page of Project Settings.
+
+
+#include "Character/BaseCharacter.h"
+#include "Character/GuardCharacter.h"
+#include "AI/GuardAIController.h"
+#include "Character/PlayerSessionState.h"
+#include "Character/BaseAttributeSet.h"
+#include "AbilitySystemComponent.h"
+#include "GameFramework/SpringArmComponent.h"
+#include "Camera/CameraComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "EnhancedInputComponent.h"
+#include "Components/InputComponent.h"
+#include "InputCoreTypes.h"
+#include "EnhancedInputSubsystems.h"
+#include "AbilitySystemBlueprintLibrary.h"
+#include "Net/UnrealNetwork.h"
+#include "Interfaces/Carryable.h"   // 운반 상태를 노획물에게 알린다 (SetHeldActor)
+#include "GameplayTagContainer.h"
+#include "GameplayTagAssetInterface.h"   // 노획물의 Loot.Type.* 태그를 읽는다 (IsCarryingHeavyItem)
+#include "Core/HeavyHandedGameplayTags.h"
+#include "Loot/LootBase.h"               // ComputeHeavyCarryTransform, GetSoloDragPitchDegrees
+#include "Loot/LootHeavyComponent.h"     // GetGripSocketA/B
+#include "Noise/NoiseEmitterComponent.h" // Sprint 소음 발행
+#include "Character/Ability/GAB_Interact.h" // Server_CancelRevive 가 이 캐릭터의 GAB_Interact 인스턴스를 찾아 호출한다
+
+// 운반 동기화 진단용. 이 경로는 실패해도 예외가 없고 "클라에서 아이템이 그대로 있다"
+// 로만 드러나서, 어디까지 도달했는지 로그 없이는 알 수 없다.
+DEFINE_LOG_CATEGORY_STATIC(LogCarry, Log, All);
+
+// Sets default values
+ABaseCharacter::ABaseCharacter()
+{
+	// [체포 추가] 체포 상태·담당 경비·이동 잠금이 서버에서 클라이언트로 전달되도록 한다.
+	bReplicates = true;
+ 	// Set this character to call Tick() every frame.  You can turn this off to improve performance if you don't need it.
+	PrimaryActorTick.bCanEverTick = true;
+
+    // --- 1인칭 카메라 설정 (스프링 암 관련 코드는 제거) ---
+    FollowCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FollowCamera"));
+    FollowCamera->SetupAttachment(RootComponent);
+    FollowCamera->bUsePawnControlRotation = true; // 마우스 회전에 따라 카메라가 같이 회전
+
+    // 카메라 위치를 캐릭터의 눈높이(약 Z축 64cm 위)로 설정
+    FollowCamera->SetRelativeLocation(FVector(0.0f, 0.0f, 64.0f));
+
+    NoiseEmitter = CreateDefaultSubobject<UNoiseEmitterComponent>(TEXT("NoiseEmitter"));
+
+    // --- 캐릭터 이동 및 회전 방향 설정 ---
+    bUseControllerRotationYaw = true; // 1인칭은 시선과 몸통 방향을 일치시키기 위해 true로 설정
+}
+
+// Called when the game starts or when spawned
+void ABaseCharacter::BeginPlay()
+{
+	Super::BeginPlay();
+
+	// [컨트롤러가 없는 것은 정상이다] 시뮬레이티드 프록시(남의 캐릭터)에는 컨트롤러가 없고,
+	// 서버의 원격 폰도 빙의 순서에 따라 이 시점에 비어 있을 수 있다.
+	// 예전에는 여기서 Error 를 찍어 접속할 때마다 에러가 쌓였다.
+
+	// 레벨에 배치한 캐릭터(Auto Possess)는 여기서 이미 빙의돼 있다 —
+	// APawn::PreInitializeComponents 가 BeginPlay 보다 먼저 Possess 하기 때문이다.
+	//
+	// 반대로 GameMode 가 스폰하는 폰은 아직 빙의 전이라 여기서는 아무 일도 일어나지 않고,
+	// 그때는 NotifyControllerChanged 가 받는다. 두 경로 모두 같은 함수 하나를 부른다.
+	SetupLocalPlayerInput();
+}
+
+void ABaseCharacter::NotifyControllerChanged()
+{
+	Super::NotifyControllerChanged();
+
+	// 빙의가 BeginPlay 뒤에 오는 경로(진입점 스폰)를 여기서 받는다.
+	// 빙의 해제 때도 불리지만, 그때는 컨트롤러가 없어 아래에서 조용히 되돌아간다
+	SetupLocalPlayerInput();
+}
+
+void ABaseCharacter::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// [체포 추가] 플레이어가 제거되거나 레벨을 나가면 경비가 사라진 대상을 계속 감시하지 않게 한다.
+	// 기존 부모 EndPlay는 아래에서 그대로 호출한다.
+	if (HasAuthority())
+	{
+		ReleaseRestraint();
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+bool ABaseCharacter::TryRestrain(AGuardCharacter* Guard)
+{
+	// [체포 추가] 상태 변경은 서버 전용이다. 이미 체포된 대상을 다시 등록하지 않으므로
+	// 여러 경비의 체포 타이머가 같은 틱에 끝나도 처음 성공한 경비만 담당할 수 있다.
+	if (!HasAuthority() || bIsRestrained || !IsValid(Guard))
+	{
+		return false;
+	}
+	const AGuardAIController* GuardController = Cast<AGuardAIController>(Guard->GetController());
+	if (!IsValid(GuardController) || GuardController->IsInCustody())
+	{
+		return false;
+	}
+	RestrainingGuard = Guard;
+	// [체포 추가] 담당 경비와 체포 여부를 먼저 확정한 뒤 실제 이동 차단을 적용한다.
+	// 진행 중인 점프·달리기도 종료해 체포 이후 달리기 효과나 스태미나 소모가 남지 않게 한다.
+	bIsRestrained = true;
+	StopJumping();
+	Server_ApplyGameplayEffect_Implementation(SprintGameplayEffectClass, false);
+	RefreshMovementLock();
+	ForceNetUpdate();
+	return true;
+}
+
+void ABaseCharacter::ReleaseRestraint()
+{
+	// [체포 추가] 서버 구출 판정 또는 생명주기 정리에서 호출한다. 클라이언트 호출은 무시한다.
+	if (!HasAuthority() || !bIsRestrained)
+	{
+		return;
+	}
+	AGuardAIController* GuardController = IsValid(RestrainingGuard) ? Cast<AGuardAIController>(RestrainingGuard->GetController()) : nullptr;
+	bIsRestrained = false;
+	// [체포 추가] 경비에게 종료를 알리기 전에 양쪽 관계 중 플레이어 쪽을 먼저 해제한다.
+	// EndCustody가 다시 해제를 요청해도 이미 false이므로 체포 해제가 반복되지 않는다.
+	RestrainingGuard = nullptr;
+	RefreshMovementLock();
+	ForceNetUpdate();
+	if (IsValid(GuardController))
+	{
+		GuardController->EndCustody(this);
+	}
+}
+
+void ABaseCharacter::DebugReleaseRestraint()
+{
+	// [체포 테스트 치트] 이동 입력 잠금과 별개의 키 입력이므로 체포된 상태에서도 요청할 수 있다.
+	// 로컬 플레이어의 캐릭터만 요청하고, 해제 판정은 리슨 호스트·원격 클라이언트 모두 서버가 수행한다.
+	if (!IsLocallyControlled() || !bEnableRestraintEscapeCheat) return;
+	Server_DebugReleaseRestraint();
+}
+
+void ABaseCharacter::Server_DebugReleaseRestraint_Implementation()
+{
+	if (!HasAuthority() || !bEnableRestraintEscapeCheat || !bIsRestrained) return;
+	// [체포 테스트 치트] 기존 해제 경로를 사용해 이동 복구와 담당 경비의 감시 종료를 함께 처리한다.
+	ReleaseRestraint();
+	UE_LOG(LogGuardAI, Log, TEXT("[체포 치트][%s] L 키로 체포 해제"), *GetName());
+}
+
+void ABaseCharacter::SetTemporaryMovementLock(AActor* Source, bool bLocked)
+{
+	// [체포 추가 / 현재 미연결] 같은 원인은 한 번만 등록하고, 해제할 때 해당 원인만 제거한다.
+	// 덫·구역·밴의 호출부는 원복했으므로 현재 그 기능들의 이동 제한은 여기서 관리하지 않는다.
+	if (!HasAuthority() || !IsValid(Source))
+	{
+		return;
+	}
+	TemporaryMovementLocks.RemoveAll([](const TWeakObjectPtr<AActor>& Lock) { return !Lock.IsValid(); });
+	const TWeakObjectPtr<AActor> SourcePtr(Source);
+	if (bLocked)
+	{
+		TemporaryMovementLocks.AddUnique(SourcePtr);
+		Source->OnEndPlay.AddUniqueDynamic(this, &ABaseCharacter::HandleMovementLockSourceEndPlay);
+		// [체포 추가] API로 등록한 원인이 파괴되어 정상 해제 호출을 못 해도 잠금이 영구히 남지 않게 한다.
+	}
+	else
+	{
+		TemporaryMovementLocks.Remove(SourcePtr);
+		Source->OnEndPlay.RemoveDynamic(this, &ABaseCharacter::HandleMovementLockSourceEndPlay);
+	}
+	RefreshMovementLock();
+}
+
+void ABaseCharacter::HandleMovementLockSourceEndPlay(AActor* Actor, EEndPlayReason::Type EndPlayReason)
+{
+	// [체포 추가] 등록된 잠금 원인이 사라지면 그 원인과 무효한 참조를 정리한 뒤 잠금을 재판정한다.
+	if (!HasAuthority()) return;
+	TemporaryMovementLocks.Remove(TWeakObjectPtr<AActor>(Actor));
+	TemporaryMovementLocks.RemoveAll([](const TWeakObjectPtr<AActor>& Lock) { return !Lock.IsValid(); });
+	RefreshMovementLock();
+}
+
+void ABaseCharacter::RefreshMovementLock()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+	UCharacterMovementComponent* Movement = GetCharacterMovement();
+	if (!IsValid(Movement))
+	{
+		return;
+	}
+	const bool bShouldLock = bIsRestrained || !TemporaryMovementLocks.IsEmpty();
+	// [체포 추가] 잠금 여부가 실제로 바뀔 때만 이동 모드와 복제 값을 갱신한다.
+	// 체포된 상태에서 임시 잠금 하나가 풀려도 bShouldLock이 true면 체포는 유지된다.
+	// 단, 이 API 밖에서 직접 변경한 이동 모드는 감시하거나 강제로 재적용하지 않는다.
+	if (bShouldLock == bMovementLocked)
+	{
+		return;
+	}
+	if (bShouldLock)
+	{
+		// [체포 추가] 최초 잠금 직전의 모드만 저장한다. 기존 모드가 이미 MOVE_None이면
+		// 해제 후에도 MOVE_None으로 돌아갈 수 있으므로, 외부 이동 제한과의 조정은 별도 문제다.
+		MovementModeBeforeLock = Movement->MovementMode;
+		CustomMovementModeBeforeLock = Movement->CustomMovementMode;
+	}
+	bMovementLocked = bShouldLock;
+	// [체포 추가] 서버에서는 RepNotify가 자동 실행되지 않으므로 직접 호출해 즉시 멈춘다.
+	// ForceNetUpdate로 클라이언트의 입력 차단 상태도 다음 복제 기회에 전달한다.
+	OnRep_MovementLocked();
+	ForceNetUpdate();
+}
+
+void ABaseCharacter::OnRep_MovementLocked()
+{
+	// [체포 추가] 서버의 직접 호출과 클라이언트의 복제 수신이 같은 이동 차단 처리를 사용한다.
+	UCharacterMovementComponent* Movement = GetCharacterMovement();
+	if (!IsValid(Movement))
+	{
+		return;
+	}
+	if (bMovementLocked)
+	{
+		// [체포 추가] 남은 이동 입력·속도·점프를 지우고 MOVE_None으로 고정한다.
+		// MOVE_None은 중력도 멈춘다. 시점 회전이나 다른 어빌리티 입력 전체를 막는 처리는 아니다.
+		StopJumping();
+		ConsumeMovementInputVector();
+		Movement->StopMovementImmediately();
+		Movement->DisableMovement();
+	}
+	else
+	{
+		// [체포 추가] 모든 등록된 잠금이 해제되면 서버가 보관한 원래 이동 모드로 복구한다.
+		// 덫 등 외부 코드가 직접 관리하는 제한은 이 목록에 없으므로 자동 보존하지 못한다.
+		Movement->SetMovementMode(MovementModeBeforeLock, CustomMovementModeBeforeLock);
+	}
+}
+
+void ABaseCharacter::SetupLocalPlayerInput()
+{
+	// 클라이언트든 서버든 '로컬 플레이어'인 경우에만 입력 매핑을 추가한다.
+	APlayerController* PlayerController = Cast<APlayerController>(GetController());
+	if (!PlayerController)
+	{
+		return;
+	}
+
+	// 이 캐릭터를 조종하는 로컬 플레이어인지 확인 (AI나 다른 플레이어 소유일 때 오류 방지)
+	if (!PlayerController->IsLocalController())
+	{
+		return;
+	}
+
+	ULocalPlayer* LocalPlayer = PlayerController->GetLocalPlayer();
+	if (!LocalPlayer)
+	{
+		return;
+	}
+
+	// 게임플레이 입력 모드를 되돌린다. **매핑 컨텍스트보다 먼저 한다** —
+	// IMC 지정을 빠뜨린 캐릭터라도 마우스는 창에 붙어 있어야 원인을 찾을 수 있다.
+	//
+	// [왜 여기서 되돌려야 하나] 입력 모드는 PlayerController 가 아니라 UGameViewportClient 에
+	//   기록되고, 그 객체는 GameInstance 소유라 **레벨 이동을 건너 살아남는다.**
+	//   은신처의 PC_ShelterPlayerController 가 로비 UI 때문에 SetInputMode_GameAndUI 를 부르는데,
+	//   엔진 구현(FInputModeGameAndUI::ApplyInputMode)이 이렇게 한다 —
+	//       SlateOperations.ReleaseMouseCapture();
+	//       GameViewportClient.SetMouseCaptureMode(EMouseCaptureMode::CaptureDuringMouseDown);
+	//   그리고 작업 레벨의 PlayerController 는 엔진 기본 APlayerController 라 아무도 되돌리지 않는다.
+	//   그 결과 저택에서 마우스가 창에 안 붙고 커서가 화면 밖으로 빠진다.
+	//   (증상이 "회전이 제한적이다", "alt-tab 하고 오면 정상이다" 로 나타났던 것이 이것이다)
+	//
+	// 은신처는 ABaseCharacter 를 스폰하지 않으므로(GM_ShelterGameMode 에 DefaultPawnClass 가 없어
+	// ADefaultPawn 을 쓴다) 이 호출이 로비 UI 를 방해하지 않는다.
+	PlayerController->SetInputMode(FInputModeGameOnly());
+	PlayerController->SetShowMouseCursor(false);
+
+	UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer);
+	if (!Subsystem)
+	{
+		return;
+	}
+
+	// 에디터에서 UPROPERTY로 IMC를 할당해 둔 경우 (예: DefaultMappingContext)
+	//
+	// 비어 있으면 이 캐릭터는 아무 입력도 받지 못한다. 그 상태의 증상이 "마우스도 키도
+	// 안 먹는다" 뿐이라 원인을 짐작할 수 없으므로, 조용히 넘어가지 않고 한 번 알린다
+	if (!DefaultMappingContext)
+	{
+		UE_LOG(LogCarry, Warning,
+			TEXT("%s 에 DefaultMappingContext 가 비어 있어 입력 매핑을 붙이지 못했습니다. "
+				 "캐릭터 블루프린트에서 IMC 를 지정하세요."),
+			*GetName());
+		return;
+	}
+
+	// 두 경로(BeginPlay · NotifyControllerChanged)에서 모두 불리므로 중복 호출이 된다.
+	// AddMappingContext 는 같은 컨텍스트를 두 번 넣지 않으므로 그대로 두어도 안전하다
+	Subsystem->AddMappingContext(DefaultMappingContext, 0);
+}
+
+void ABaseCharacter::PossessedBy(AController* NewController)
+{
+    Super::PossessedBy(NewController);
+
+    // 서버 권한에서 AbilityInputBindings에 등록된 모든 스킬들을 ASC에 부여합니다.
+    if (HasAuthority())
+    {
+        APlayerSessionState* SessionState = GetPlayerState<APlayerSessionState>();
+        if (SessionState)
+        {
+            UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+            if (ASC)
+            {
+                ASC->InitAbilityActorInfo(SessionState, this);
+
+                int32 InputID = 0;
+                for (const FAbilityInputBinding& Binding : AbilityInputBindings)
+                {
+                    if (Binding.AbilityClass)
+                    {
+                        // 배열 순서대로 고유 InputID 부여 (0, 1, 2, ...)
+                        ASC->GiveAbility(FGameplayAbilitySpec(Binding.AbilityClass, 1, InputID, this));
+                    }
+                    ++InputID;
+                }
+            }
+        }
+    }
+
+    // 서버 측에서 컨트롤러 소유가 끝났을 때 바인딩 실행
+    BindAttributeDelegates();
+}
+
+// Called every frame
+void ABaseCharacter::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+
+	UpdateHeavyCarryTransform();
+
+	if (!IsLocallyControlled() && FollowCamera)
+	{
+		FollowCamera->SetWorldRotation(GetViewRotation());
+	}
+}
+
+// Called to bind functionality to input
+void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+    Super::SetupPlayerInputComponent(PlayerInputComponent);
+	// [체포 테스트 치트] 새 IA/IMC 에셋 없이 L을 직접 바인딩한다. 기존 액션·스킬 바인딩은 유지한다.
+	// 키를 한 번 누를 때만 요청하며, 패키징 빌드에서도 동일하게 동작한다.
+	if (IsValid(PlayerInputComponent) && bEnableRestraintEscapeCheat)
+	{
+		PlayerInputComponent->BindKey(EKeys::L, IE_Pressed, this, &ABaseCharacter::DebugReleaseRestraint);
+	}
+
+    if (UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(PlayerInputComponent))
+    {
+        // 전후 이동 바인딩 (W, S)
+        if (IA_MoveForward)
+        {
+            EnhancedInputComponent->BindAction(IA_MoveForward, ETriggerEvent::Triggered, this, &ABaseCharacter::MoveForward);
+        }
+
+        // 좌우 이동 바인딩 (A, D)
+        if (IA_MoveRight)
+        {
+            EnhancedInputComponent->BindAction(IA_MoveRight, ETriggerEvent::Triggered, this, &ABaseCharacter::MoveRight);
+        }
+
+        // Turn (좌우) 바인딩
+        if (IA_Turn)
+        {
+            EnhancedInputComponent->BindAction(IA_Turn, ETriggerEvent::Triggered, this, &ABaseCharacter::Turn);
+        }
+
+        // LookUp (상하) 바인딩
+        if (IA_LookUp)
+        {
+            EnhancedInputComponent->BindAction(IA_LookUp, ETriggerEvent::Triggered, this, &ABaseCharacter::LookUp);
+        }
+
+        if (IA_Sprint)
+        {
+            EnhancedInputComponent->BindAction(IA_Sprint, ETriggerEvent::Started, this, &ABaseCharacter::StartSprint);
+            EnhancedInputComponent->BindAction(IA_Sprint, ETriggerEvent::Completed, this, &ABaseCharacter::StopSprint);
+        }
+        if (IA_Crouch)
+        {
+            EnhancedInputComponent->BindAction(IA_Crouch, ETriggerEvent::Started, this, &ABaseCharacter::StartCrouch);
+            EnhancedInputComponent->BindAction(IA_Crouch, ETriggerEvent::Completed, this, &ABaseCharacter::StopCrouch);
+        }
+
+		if (IA_Jump)
+		{
+			EnhancedInputComponent->BindAction(IA_Jump, ETriggerEvent::Started, this, &ABaseCharacter::TryJump);
+			EnhancedInputComponent->BindAction(IA_Jump, ETriggerEvent::Completed, this, &ACharacter::StopJumping);
+		}
+
+        int32 InputID = 0;
+        for (const FAbilityInputBinding& Binding : AbilityInputBindings)
+        {
+            if (Binding.InputAction && Binding.AbilityClass)
+            {
+                // 누를 때: 활성화 시도 + Pressed 상태 등록
+                EnhancedInputComponent->BindAction(
+                    Binding.InputAction,
+                    ETriggerEvent::Started,
+                    this,
+                    &ABaseCharacter::AbilityInputPressed,
+                    InputID
+                );
+
+                // 뗄 때: 해당 InputID를 가진 활성 어빌리티의 InputReleased 콜백 호출
+                EnhancedInputComponent->BindAction(
+                    Binding.InputAction,
+                    ETriggerEvent::Completed,
+                    this,
+                    &ABaseCharacter::AbilityInputReleased,
+                    InputID
+                );
+            }
+            ++InputID;
+        }
+    }
+}
+
+UAbilitySystemComponent* ABaseCharacter::GetAbilitySystemComponent() const
+{
+    // --- 캐릭터 본인 대신 PlayerSessionState의 ASC를 리턴하도록 변경 ---
+    if (APlayerSessionState* SessionState = GetPlayerState<APlayerSessionState>())
+    {
+        return SessionState->GetAbilitySystemComponent();
+    }
+    return nullptr;
+}
+
+// 2. 전진/후진 처리 함수 (Axis 1D 값 활용)
+void ABaseCharacter::MoveForward(const FInputActionValue& Value)
+{
+    // [체포 추가] 잠금 중 전후 이동 입력만 차단한다. 아래 기존 이동 계산은 그대로 유지한다.
+    if (bMovementLocked) return;
+    const float DirectionValue = Value.Get<float>();
+
+    if (Controller != nullptr && DirectionValue != 0.0f)
+    {
+        const FRotator Rotation = Controller->GetControlRotation();
+        const FRotator YawRotation(0, Rotation.Yaw, 0);
+        const FVector Direction = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::X);
+
+        AddMovementInput(Direction, DirectionValue);
+    }
+}
+
+// 3. 좌우 이동 처리 함수 (Axis 1D 값 활용)
+void ABaseCharacter::MoveRight(const FInputActionValue& Value)
+{
+    // [체포 추가] 잠금 중 좌우 이동 입력만 차단한다. Turn/LookUp의 카메라 입력은 막지 않는다.
+    if (bMovementLocked) return;
+    const float DirectionValue = Value.Get<float>();
+
+    if (Controller != nullptr && DirectionValue != 0.0f)
+    {
+        const FRotator Rotation = Controller->GetControlRotation();
+        const FRotator YawRotation(0, Rotation.Yaw, 0);
+        const FVector Direction = FRotationMatrix(YawRotation).GetUnitAxis(EAxis::Y);
+
+        AddMovementInput(Direction, DirectionValue);
+    }
+}
+
+void ABaseCharacter::Turn(const FInputActionValue& Value)
+{
+    float AxisValue = Value.Get<float>();
+    if (AxisValue != 0.0f)
+    {
+        // 중량형을 들고 있는 동안(솔로·협동 둘 다) 마우스로 화면을 홱 돌리지 못하게
+        // 감도를 크게 낮춘다. HeavyCarryState 는 주 운반자·보조자 양쪽 다 Coop 로
+        // 바뀌므로(솔로는 주 운반자만 Solo) 이 검사 하나로 둘 다 걸린다.
+        if (HeavyCarryState != EHeavyCarryState::None)
+        {
+            AxisValue *= HeavyCarryYawInputScale;
+        }
+
+        AddControllerYawInput(AxisValue);
+    }
+}
+
+void ABaseCharacter::LookUp(const FInputActionValue& Value)
+{
+    float AxisValue = Value.Get<float>();
+    if (AxisValue != 0.0f)
+    {
+        AddControllerPitchInput(AxisValue);
+    }
+}
+
+// 예시: 캐릭터가 컨트롤러를 소유하거나 ASC가 초기화될 때 호출되는 함수 내부에서 바인딩 실행
+void ABaseCharacter::BindAttributeDelegates()
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC) return;
+
+    // ASC로부터 UBaseAttributeSet 가져오기
+    const UBaseAttributeSet* BaseAttrSet = ASC->GetSet<UBaseAttributeSet>();
+    if (BaseAttrSet)
+    {
+        // MovementSpeed 속성 변화를 감지하는 델리게이트 구독
+        ASC->GetGameplayAttributeValueChangeDelegate(BaseAttrSet->GetMovementSpeedAttribute()).AddUObject(this, &ABaseCharacter::OnMovementSpeedChanged);
+
+        // Stamina 속성 변화를 감지하는 델리게이트 구독 — 고갈(0 도달) 판정에 쓴다.
+        ASC->GetGameplayAttributeValueChangeDelegate(BaseAttrSet->GetStaminaAttribute()).AddUObject(this, &ABaseCharacter::OnStaminaChanged);
+    }
+
+    // State.Sprinting 태그 추가/제거를 구독한다. SprintGameplayEffectClass 가 이 태그를
+    // 부여하도록 만들어져 있어야 한다 — 태그만 있고 GE 가 안 붙이면 이 델리게이트는 영원히 안 불린다.
+    ASC->RegisterGameplayTagEvent(HHTags::State_Sprinting, EGameplayTagEventType::NewOrRemoved)
+        .AddUObject(this, &ABaseCharacter::OnSprintTagChanged);
+}
+
+// 속성이 변경될 때 자동 호출되어 실제 무브먼트 속도에 적용
+void ABaseCharacter::OnMovementSpeedChanged(const FOnAttributeChangeData& Data)
+{
+    if (UCharacterMovementComponent* MoveComp = GetCharacterMovement())
+    {
+        // Data.NewValue는 변경된 MovementSpeed의 새로운 값입니다.
+        MoveComp->MaxWalkSpeed = Data.NewValue;
+    }
+}
+
+// Stamina 가 0 에 도달하면(서버 권위) 스프린트를 강제로 끊고 Exhausted 상태로 넘긴다.
+// 델리게이트는 서버·클라 양쪽 ASC 인스턴스에서 다 불릴 수 있어 HasAuthority() 로 먼저 거른다.
+void ABaseCharacter::OnStaminaChanged(const FOnAttributeChangeData& Data)
+{
+    if (!HasAuthority())
+    {
+        return;
+    }
+
+    if (Data.NewValue > 0.0f)
+    {
+        return;
+    }
+
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC || ASC->HasMatchingGameplayTag(HHTags::State_Exhausted))
+    {
+        // 이미 Exhausted 상태면 중복 진입하지 않는다 (쿨다운 타이머가 두 번 걸리는 것을 막는다).
+        return;
+    }
+
+    RemoveGameplayEffectFromSelf(SprintGameplayEffectClass);
+    ApplyGameplayEffectToSelf(ExhaustedGameplayEffectClass);
+
+    GetWorld()->GetTimerManager().SetTimer(
+        ExhaustedCooldownTimerHandle, this, &ABaseCharacter::OnExhaustedCooldownExpired,
+        ExhaustedCooldownSeconds, /*bLoop*/ false);
+}
+
+// ExhaustedCooldownTimerHandle 만료 시 호출 — State.Exhausted 를 해제해 재진입을 허용한다.
+void ABaseCharacter::OnExhaustedCooldownExpired()
+{
+    RemoveGameplayEffectFromSelf(ExhaustedGameplayEffectClass);
+}
+
+void ABaseCharacter::OnSprintTagChanged(const FGameplayTag Tag, int32 NewCount)
+{
+    // ReportTaggedNoise 자체도 서버 전용이라, 타이머를 클라이언트에서 돌릴 이유가 없다.
+    if (!HasAuthority())
+    {
+        return;
+    }
+
+    if (NewCount > 0)
+    {
+        // 시작하자마자 한 번 내고, 이후 SprintNoiseInterval 마다 반복한다.
+        GetWorld()->GetTimerManager().SetTimer(
+            SprintNoiseTimerHandle, this, &ABaseCharacter::EmitSprintNoise,
+            SprintNoiseInterval, /*bLoop*/ true, /*FirstDelay*/ 0.f);
+
+        // 스프린트 중에는 회복하지 않는다.
+        GetWorld()->GetTimerManager().ClearTimer(StaminaRegenTimerHandle);
+    }
+    else
+    {
+        GetWorld()->GetTimerManager().ClearTimer(SprintNoiseTimerHandle);
+
+        // 스프린트 종료 즉시(지연 없이) 회복을 시작한다 — 경계도의 30초 무소음 텀과 다르다.
+        GetWorld()->GetTimerManager().SetTimer(
+            StaminaRegenTimerHandle, this, &ABaseCharacter::TickStaminaRegen,
+            StaminaRegenInterval, /*bLoop*/ true, /*FirstDelay*/ 0.f);
+    }
+}
+
+void ABaseCharacter::EmitSprintNoise()
+{
+    if (!NoiseEmitter)
+    {
+        return;
+    }
+
+    // Noise.* 는 지성인 소유라 네이티브 태그로 올리지 않고 문자열로 조회한다
+    // (Config/Tags/Noise.ini 에 이미 정의돼 있다).
+    static const FGameplayTag RunNoiseTag =
+        FGameplayTag::RequestGameplayTag(FName("Noise.Player.Run"), /*ErrorIfNotFound*/ false);
+
+    if (RunNoiseTag.IsValid())
+    {
+        NoiseEmitter->ReportTaggedNoise(RunNoiseTag);
+    }
+}
+
+// StaminaRegenTimerHandle 이 반복 호출한다. State.Sprinting 이 없는 동안만 돈다(OnSprintTagChanged 참조).
+void ABaseCharacter::TickStaminaRegen()
+{
+    if (!HasAuthority())
+    {
+        return;
+    }
+
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC)
+    {
+        return;
+    }
+
+    ASC->ApplyModToAttribute(UBaseAttributeSet::GetStaminaAttribute(), EGameplayModOp::Additive, StaminaRegenPerTick);
+}
+
+void ABaseCharacter::ApplyGameplayEffectToSelf(TSubclassOf<UGameplayEffect> EffectClass)
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (ASC && EffectClass)
+    {
+        FGameplayEffectContextHandle ContextHandle = ASC->MakeEffectContext();
+        ContextHandle.AddSourceObject(this);
+        ASC->ApplyGameplayEffectToSelf(EffectClass.GetDefaultObject(), 1.0f, ContextHandle);
+    }
+}
+
+void ABaseCharacter::RemoveGameplayEffectFromSelf(TSubclassOf<UGameplayEffect> EffectClass)
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (ASC && EffectClass)
+    {
+        ASC->RemoveActiveGameplayEffectBySourceEffect(EffectClass, ASC);
+    }
+}
+
+void ABaseCharacter::StartCrouch(const FInputActionValue& Value)
+{
+	if (IsCarryingHeavyItem())
+	{
+		UE_LOG(LogCarry, Log, TEXT("%s 는 중량형 노획물을 들고 있어 크라우치할 수 없다."), *GetName());
+		return;
+	}
+
+	if (IsDowned())  // ← 추가
+	{
+		return;
+	}
+
+	Crouch();
+    Server_ApplyGameplayEffect(CrouchGameplayEffectClass, true);
+}
+
+void ABaseCharacter::StopCrouch(const FInputActionValue& Value)
+{
+	UnCrouch();
+    Server_ApplyGameplayEffect(CrouchGameplayEffectClass, false);
+}
+
+void ABaseCharacter::StartSprint(const FInputActionValue& Value)
+{
+	// [체포 추가] 체포·등록된 이동 잠금 중 달리기 시작을 막는다. 기존 운반·다운 상태 조건은 유지한다.
+	if (bMovementLocked) return;
+	if (IsCarryingHeavyItem())
+	{
+		return;
+	}
+
+	if (IsDowned())  // ← 추가
+	{
+		return;
+	}
+
+	// 클라이언트 예측 차단 — 실제 권위 판정은 Server_ApplyGameplayEffect_Implementation 안에 있다.
+	const UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+	if (ASC && ASC->HasMatchingGameplayTag(HHTags::State_Exhausted))
+	{
+		return;
+	}
+
+    Server_ApplyGameplayEffect(SprintGameplayEffectClass, true);
+}
+
+void ABaseCharacter::StopSprint(const FInputActionValue& Value)
+{
+    Server_ApplyGameplayEffect(SprintGameplayEffectClass, false);
+}
+
+// --- 서버 RPC 실제 동작 구현 ---
+void ABaseCharacter::Server_ApplyGameplayEffect_Implementation(TSubclassOf<UGameplayEffect> EffectClass, bool bApply)
+{
+    // [체포 추가] 로컬 입력 차단만으로는 충분하지 않으므로 서버에서도 달리기 적용 요청을 거부한다.
+    // 달리기 효과의 제거 요청과 다른 종류의 효과는 아래 기존 경로를 그대로 사용한다.
+    if (!HasAuthority()) return;
+    if (bApply && EffectClass == SprintGameplayEffectClass && bMovementLocked) return;
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC || !EffectClass) return;
+
+    // 권위 판정은 API(여기) 안에 둔다 — StartSprint 의 검사는 클라 예측일 뿐, 실제 차단은 여기서 한다.
+    // Crouch 등 다른 EffectClass 호출까지 막으면 안 되므로 Sprint 요청일 때만 검사한다.
+    if (bApply && EffectClass == SprintGameplayEffectClass && ASC->HasMatchingGameplayTag(HHTags::State_Exhausted))
+    {
+        return;
+    }
+
+    if (bApply)
+    {
+        FGameplayEffectContextHandle ContextHandle = ASC->MakeEffectContext();
+        ContextHandle.AddSourceObject(this);
+        ASC->ApplyGameplayEffectToSelf(EffectClass.GetDefaultObject(), 1.0f, ContextHandle);
+    }
+    else
+    {
+        // 제거할 때 핸들 방식이거나 소스 이펙트 방식 사용
+        ASC->RemoveActiveGameplayEffectBySourceEffect(EffectClass, ASC);
+    }
+
+    // Stamina 소모 GE 는 Period 충돌 때문에 GE_Sprint 와 분리돼 있다 — 항상 같은 시점에 켜고 끈다.
+    if (EffectClass == SprintGameplayEffectClass)
+    {
+        if (bApply)
+        {
+            ApplyGameplayEffectToSelf(StaminaDrainGameplayEffectClass);
+        }
+        else
+        {
+            RemoveGameplayEffectFromSelf(StaminaDrainGameplayEffectClass);
+        }
+    }
+}
+
+bool ABaseCharacter::Server_CancelRevive_Validate()
+{
+    // 파라미터가 없어 악의적으로 조작할 값 자체가 없다 — 실제로 채널링 중이었는지는
+    // 정상 범위의 판단이라 여기가 아니라 _Implementation(→ CancelReviveChannel)에서
+    // 조용히 무시한다.
+    return true;
+}
+
+void ABaseCharacter::Server_CancelRevive_Implementation()
+{
+    // 이 RPC(캐릭터 액터 채널)와 어빌리티 활성화 RPC(ASC는 PlayerState 소유라 그쪽 채널)는
+    // 서로 다른 액터 채널이라 도착 순서가 보장되지 않는다. E 를 아주 짧게 누르고 떼면
+    // 이 취소가 활성화보다 먼저 도착할 수 있는데, 그 순간엔 아직 어빌리티가 Active 는커녕
+    // 인스턴스조차 없을 수도 있다(InstancedPerActor 는 최초 활성화 전엔 인스턴스가 없다).
+    // 그래서 인스턴스 유무·활성 여부와 무관하게 "취소 요청이 있었다"는 사실 자체를
+    // 캐릭터(항상 존재)에 먼저 기록해 둔다 — GAB_Interact::PerformInteraction 이 채널을
+    // 막 시작하려는 순간 이 시각을 확인해서, 이미 늦은 취소라면 아예 시작하지 않는다.
+    ReviveCancelRequestedTime = GetWorld()->GetTimeSeconds();
+
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC)
+    {
+        return;
+    }
+
+    // InstancedPerActor 라 캐릭터당 GAB_Interact 스펙·인스턴스가 정확히 하나다.
+    FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromClass(UGAB_Interact::StaticClass());
+    if (!Spec)
+    {
+        return;
+    }
+
+    // 이미 채널링 중인(가장 흔한) 경우 여기서 바로 끝낸다. 아직 시작 전이면
+    // CancelReviveChannel 이 조용히 넘어가고, 위에서 기록한 시각을 PerformInteraction 이
+    // 대신 확인한다.
+    if (UGAB_Interact* Interact = Cast<UGAB_Interact>(Spec->GetPrimaryInstance()))
+    {
+        Interact->CancelReviveChannel();
+    }
+}
+
+bool ABaseCharacter::ConsumeRecentReviveCancelRequest()
+{
+    if (ReviveCancelRequestedTime < 0.0)
+    {
+        return false;
+    }
+
+    const double Elapsed = GetWorld()->GetTimeSeconds() - ReviveCancelRequestedTime;
+    ReviveCancelRequestedTime = -1.0; // 결과와 무관하게 한 번 확인하면 소비한다.
+
+    // 이 시간 창(0.3초)보다 오래된 건 이번 입력과 무관한 옛 취소로 본다 — 너무 크게
+    // 잡으면 관계없는 이전 상호작용(줍기 등)의 릴리즈가 다음 부활 시도를 막아버리고,
+    // 너무 작게 잡으면 실제 RPC 도착 순서 뒤바뀜을 놓친다. 같은 커넥션의 서로 다른
+    // 액터 채널 간 도착 편차치고는 충분히 넉넉한 값이다.
+    return Elapsed <= 0.3;
+}
+
+void ABaseCharacter::AbilityInputPressed(int32 InputID)
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC) return;
+
+    // InputID가 일치하는 어빌리티를 찾아 Pressed 상태로 등록.
+    // 아직 활성화 안 된 어빌리티라면 내부적으로 TryActivateAbility까지 자동으로 처리해줌
+    ASC->AbilityLocalInputPressed(InputID);
+}
+
+void ABaseCharacter::AbilityInputReleased(int32 InputID)
+{
+    UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+    if (!ASC) return;
+
+    // InputID가 일치하는 "활성 중인" 어빌리티의 InputReleased()를 호출
+    ASC->AbilityLocalInputReleased(InputID);
+}
+
+void ABaseCharacter::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+    Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	// [체포 추가] 기존 운반·부활 복제 등록은 유지하고, 체포 판정과 이동 차단·복구에 필요한 값만 추가한다.
+	DOREPLIFETIME(ABaseCharacter, bIsRestrained);
+	DOREPLIFETIME(ABaseCharacter, RestrainingGuard);
+	DOREPLIFETIME(ABaseCharacter, bMovementLocked);
+	DOREPLIFETIME(ABaseCharacter, MovementModeBeforeLock);
+	DOREPLIFETIME(ABaseCharacter, CustomMovementModeBeforeLock);
+
+    DOREPLIFETIME(ABaseCharacter, HeldActor);
+	// 08.18 start
+	DOREPLIFETIME(ABaseCharacter, HeavyCarryAssistant);
+	DOREPLIFETIME(ABaseCharacter, AssistingPrimaryCarrier);
+	DOREPLIFETIME(ABaseCharacter, AssistedHeavyItem);
+	DOREPLIFETIME(ABaseCharacter, HeavyCarryState);
+	// 08.18 end
+	DOREPLIFETIME(ABaseCharacter, ReviveProgress);
+	DOREPLIFETIME(ABaseCharacter, bReviveChannelActive);
+
+	DOREPLIFETIME(ABaseCharacter, CarriedAlly);
+	DOREPLIFETIME(ABaseCharacter, CarrierAlly);
+}
+
+bool ABaseCharacter::CanCarryActor(const AActor* Target) const
+{
+    if (!IsValid(Target))
+    {
+        return false;
+    }
+
+    const USceneComponent* Root = Target->GetRootComponent();
+    if (!Root)
+    {
+        UE_LOG(LogCarry, Warning, TEXT("%s 에 루트 컴포넌트가 없어 운반할 수 없다."), *GetNameSafe(Target));
+        return false;
+    }
+
+    // Static 모빌리티 컴포넌트는 Movable 부모에 붙일 수 없고 물리도 켤 수 없다.
+    if (Root->Mobility != EComponentMobility::Movable)
+    {
+        UE_LOG(LogCarry, Warning,
+            TEXT("%s 의 Mobility 가 Movable 이 아니라 운반할 수 없다. "
+                 "레벨에서 해당 액터의 Transform > Mobility 를 Movable 로 바꿀 것."),
+            *GetNameSafe(Target));
+        return false;
+    }
+
+    // 남이 들고 있는 물건은 뺏을 수 없다.
+    //
+    // 노획물 쪽 ALootBase::CanBeCarriedBy 도 같은 것을 거부한다. 그런데 그 거부는
+    // OnGrabbed 안에서 일어나고 OnGrabbed 는 void 라, SetHeldActor 까지 올라오지 않는다 —
+    // 그 시점에는 어태치와 HeldActor 갱신이 이미 끝나 있다.
+    //
+    // 그래서 이 검사가 없으면 운반 상태가 두 곳으로 갈라진다. 물건은 내 메시에 붙고
+    // 나는 들었다고 믿는데, PrimaryCarrier 는 원래 주인으로 남는다. 원래 주인이 놓는 순간
+    // PrimaryCarrier 가 비워져서, 내 손에 들린 물건을 밴 적재존이 "아무도 안 들고 있다" 로
+    // 보고 실어 버린다. LastCarrier 도 안 바뀌어 기여도까지 원래 주인에게 붙는다.
+    //
+    // 어태치 전에 막아야 그 갈라짐 자체가 생기지 않는다.
+    if (const ICarryable* Carryable = Cast<ICarryable>(Target))
+    {
+        const APawn* Holder = Carryable->GetPrimaryCarrier();
+        if (IsValid(Holder) && Holder != this)
+        {
+            UE_LOG(LogCarry, Log, TEXT("%s 는 %s 가 들고 있어 잡을 수 없다."),
+                *GetNameSafe(Target), *GetNameSafe(Holder));
+            return false;
+        }
+    }
+
+    // 방금 내가 던진 물건은 잠깐 못 잡는다. 던지고 곧바로 낚아채는 반복으로
+    // 중량형의 2인 필수 규칙과 착지 소음·파손 판정을 우회하는 것을 막는다.
+    if (Target == RecentlyThrownActor && RecentlyThrownTime >= 0.f)
+    {
+        const float Elapsed = GetWorld()->GetTimeSeconds() - RecentlyThrownTime;
+        if (Elapsed < RecatchBlockSeconds)
+        {
+            UE_LOG(LogCarry, Log,
+                TEXT("%s 는 방금 던진 물건이라 %.2f초 뒤에야 다시 잡을 수 있다."),
+                *GetNameSafe(Target), RecatchBlockSeconds - Elapsed);
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void ABaseCharacter::BlockRecatch(AActor* ThrownActor)
+{
+    if (!HasAuthority() || !IsValid(ThrownActor))
+    {
+        return;
+    }
+
+    RecentlyThrownActor = ThrownActor;
+    RecentlyThrownTime = GetWorld()->GetTimeSeconds();
+}
+
+void ABaseCharacter::ApplyCarryState(AActor* Target, bool bCarried)
+{
+    if (!IsValid(Target))
+    {
+        return;
+    }
+
+    // ICarryable(= 노획물)은 물리·콜리전·부착을 스스로 관리한다. 여기서 또 손대면 두 벌이 돈다.
+    //
+    // 특히 콜리전이 정반대였다. 아래 폴백 경로는 NoCollision 으로 통째로 끄는데,
+    // ALootBase 는 CarriedLoot 프로파일(QueryOnly, 다른 캐릭터만 Block)로 바꿔 켜 둔다.
+    // 그 프로파일이 '들고 있는 물건이 남을 막는다' 는 협동 방해의 근거라 꺼지면 안 되고,
+    // 놓을 때의 SetCollisionEnabled(QueryAndPhysics)도 QueryOnly 프로파일을 어긋나게 남긴다.
+    //
+    // OnGrabbed/OnReleased 는 서버 전용이다. 클라이언트는 ALootBase 의
+    // OnRep_PrimaryCarrier 가 똑같은 일을 하므로 여기서는 아무것도 하지 않는다.
+    if (ICarryable* Carryable = Cast<ICarryable>(Target))
+    {
+        if (HasAuthority())
+        {
+            if (bCarried)
+            {
+                Carryable->OnGrabbed(this);
+            }
+            else
+            {
+                Carryable->OnReleased(this);
+            }
+        }
+
+        return;
+    }
+
+    // 이하는 ICarryable 을 구현하지 않은 액터용 폴백이다.
+    // (테스트 맵의 "Item" 태그 액터 등. 노획물이 전부 ALootBase 가 되면 지운다)
+    UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(Target->GetRootComponent());
+
+    if (bCarried)
+    {
+        // 순서가 중요하다. 물리를 먼저 끄지 않으면 부착이 거부된다 —
+        // 런타임에는 시뮬레이션 중인 바디를 웰드 없이 붙일 수 없다
+        // (엔진 SceneComponent.cpp:2151, 이중 트랜스폼 갱신 방지).
+        // 던진 직후의 아이템이 다시 집히지 않던 원인이 이것이었다.
+        if (PrimComp)
+        {
+            PrimComp->SetSimulatePhysics(false);
+            PrimComp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        }
+
+        Target->AttachToComponent(
+            GetMesh(),
+            FAttachmentTransformRules::SnapToTargetNotIncludingScale,
+            CarrySocketName);
+    }
+    else
+    {
+        Target->DetachFromActor(FDetachmentTransformRules(EDetachmentRule::KeepWorld, true));
+
+        if (PrimComp)
+        {
+            // 콜리전을 먼저 켜야 물리 바디가 올바른 상태로 깨어난다
+            PrimComp->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+            PrimComp->SetSimulatePhysics(true);
+        }
+    }
+}
+
+bool ABaseCharacter::SetHeldActor(AActor* NewHeldActor, bool bIsHeavyLoot)
+{
+    // 운반 상태의 소유권은 서버에 있다. 클라이언트가 직접 바꾸면
+    // 다음 복제 때 덮어써지면서 물리 상태만 어긋난다.
+    if (!HasAuthority())
+    {
+        return false;
+    }
+
+    if (HeldActor == NewHeldActor)
+    {
+        return true;
+    }
+
+    // 들고 있던 것을 먼저 놓는다.
+    if (AActor* PreviousHeldActor = HeldActor)
+    {
+        // 노획물에게 알리는 것까지 여기서 끝난다 — ApplyCarryState 가 ICarryable 이면
+        // OnReleased 를 부르고 바로 반환한다. 그쪽이 PrimaryCarrier 를 비우고
+        // Loot.State.Dropped 를 붙이며, 그게 없으면 밴 적재존이 "아무도 안 들고 있다" 를
+        // 영영 참으로 보고 압력판 같은 상태 기반 판정도 물건이 놓였다는 것을 모른다.
+        //
+        // 예전에는 여기서 OnReleased 를 한 번 더 불렀다. 코어 루프가 명시 호출을 넣은 것과
+        // 노획물 파트가 ApplyCarryState 안으로 같은 호출을 옮긴 것이 각자 브랜치에서 진행돼
+        // 병합 뒤 두 번 불리게 된 것이다. ALootBase::ApplyCarryState 의 멱등 가드가 막아 주고
+        // 있었을 뿐, 그 가드가 없으면 ApplyDropImpulse 가 두 번 들어가 놓은 물건이 튀어 나간다.
+        ApplyCarryState(PreviousHeldActor, false);
+
+        UE_LOG(LogCarry, Log, TEXT("[서버] 운반 해제: %s"), *GetNameSafe(PreviousHeldActor));
+
+		//08.18 Add
+		RemoveHeavySoloPenalty();
+
+		// 보조자가 있으면 AT_MonitorHeavyCarry 의 다음 틱 폴링을 기다리지 않고
+		// Event.Loot.Dropped 로 즉시 통지해 보조 상태를 바로 정리시킨다.
+		if (HeavyCarryAssistant)
+		{
+			FGameplayEventData EventData;
+			EventData.Target = PreviousHeldActor;
+			UAbilitySystemBlueprintLibrary::SendGameplayEventToActor(
+				HeavyCarryAssistant,
+				HHTags::Event_Loot_Dropped,
+				EventData);
+		}
+    }
+
+    HeldActor = nullptr;
+    HeavyCarryState = EHeavyCarryState::None;
+
+    if (!NewHeldActor)
+    {
+        return true;
+    }
+
+    if (!CanCarryActor(NewHeldActor))
+    {
+        return false;
+    }
+
+    // 노획물에게 알리는 것까지 여기서 끝난다 — ApplyCarryState 가 ICarryable 이면
+    // OnGrabbed 를 부르고 바로 반환한다. 그쪽이 PrimaryCarrier / LastCarrier 를 채우고
+    // 소켓에 붙이며, 소지 중 콜리전 프로파일과 운반자 상호 무시까지 건다.
+    //
+    // **아래 두 검증이 이 호출의 결과를 본다.** 그래서 이 줄이 먼저여야 한다.
+    ApplyCarryState(NewHeldActor, true);
+
+    // 노획물은 자기가 요청을 거부할 수 있다 (이미 남이 들고 있음, 중량형 인원 부족 등).
+    // 거부하면 부착 자체가 일어나지 않아 아래 검증에 걸리는데, 그쪽 경고는
+    // "AttachTo 경고를 확인하라" 고 안내해서 원인을 엉뚱한 데서 찾게 만든다.
+    // 거부는 정상 흐름이므로 여기서 따로 구분한다.
+    if (const ICarryable* Carryable = Cast<const ICarryable>(NewHeldActor))
+    {
+        if (Carryable->GetPrimaryCarrier() != this)
+        {
+            UE_LOG(LogCarry, Log, TEXT("[서버] %s 가 운반 요청을 거부했다. (CanBeCarriedBy)"),
+                *GetNameSafe(NewHeldActor));
+            return false;
+        }
+
+        // ICarryable 은 스스로 성공을 보고했다(GetPrimaryCarrier() == this) — 어떻게
+        // 붙잡을지(AttachToComponent 든 Kinematic 직접 이동이든)는 구현체 책임이라 여기서
+        // Attach 여부를 다시 확인하지 않는다. 중량형은 매 틱 SetActorLocationAndRotation 으로만
+        // 옮기고 AttachToComponent 를 아예 안 써서, 아래 Attach 재확인 검증에 걸리면
+        // 정상적으로 붙잡았는데도 "부착 실패"로 오판해 곧바로 놓아버리게 된다.
+    }
+    else
+    {
+        // 레거시 폴백(ICarryable 을 구현하지 않은 액터) 전용 검증.
+        // AActor::AttachToComponent 는 void 라 성공 여부를 돌려주지 않는다.
+        // 확인 없이 넘기면 붙지도 않은 액터를 "들고 있다"고 믿게 되고,
+        // 그 상태로 던지면 엉뚱한 곳에 임펄스가 들어간다.
+        const USceneComponent* NewRoot = NewHeldActor->GetRootComponent();
+        if (!NewRoot || NewRoot->GetAttachParent() != GetMesh())
+        {
+            UE_LOG(LogCarry, Warning,
+                TEXT("[서버] %s 부착에 실패해 운반 상태로 넘기지 않는다. (직전 AttachTo 경고 확인)"),
+                *GetNameSafe(NewHeldActor));
+
+            // 물리를 되돌려 원래 상태로 남긴다.
+            ApplyCarryState(NewHeldActor, false);
+            return false;
+        }
+    }
+
+    // 여기까지 왔으면 노획물 쪽은 이미 운반 상태다. 위 ApplyCarryState 가 다 했고,
+    // 두 검증은 그 결과가 실제로 반영됐는지만 확인한 것이다.
+    HeldActor = NewHeldActor;
+
+	// StartCrouch 입력 차단만으로는 "이미 웅크린 채로 줍는" 경우를 못 막는다.
+	if (bIsCrouched && IsCarryingHeavyItem())
+	{
+		UnCrouch();
+		RemoveGameplayEffectFromSelf(CrouchGameplayEffectClass);
+		UE_LOG(LogCarry, Log, TEXT("[서버] %s 중량형 노획물을 집어 크라우치 강제 해제"), *GetName());
+	}
+
+	//08.18 수정 start
+	if (IsCarryingHeavyItem())
+	{
+		ApplyHeavySoloPenalty();
+		HeavyCarryState = EHeavyCarryState::Solo;
+		UE_LOG(LogCarry, Log, TEXT("[서버] %s 는 무거운 물건 - 혼자 들어서 이동속도 패널티 적용"), *GetNameSafe(NewHeldActor));
+	}
+	//08.18 수정 end
+
+    UE_LOG(LogCarry, Log, TEXT("[서버] 운반 시작: %s | Replicates=%s, ReplicateMovement=%s"),
+        *GetNameSafe(NewHeldActor),
+        NewHeldActor->GetIsReplicated() ? TEXT("O") : TEXT("X"),
+        NewHeldActor->IsReplicatingMovement() ? TEXT("O") : TEXT("X"));
+
+    // 복제되지 않는 액터는 클라이언트에서 HeldActor 참조 자체가 풀리지 않는다.
+    if (!NewHeldActor->GetIsReplicated())
+    {
+        UE_LOG(LogCarry, Warning,
+            TEXT("[서버] %s 는 복제되지 않는 액터다. 클라이언트에서는 손에 붙지 않는다 — "
+                 "해당 액터의 Replicates(StaticMeshActor 는 Static Mesh Replicate Movement)를 켤 것."),
+            *GetNameSafe(NewHeldActor));
+    }
+
+    return true;
+}
+
+void ABaseCharacter::OnRep_HeldActor(AActor* PreviousHeldActor)
+{
+    // 클라이언트도 서버와 똑같은 순서를 다시 밟는다.
+    // 엔진의 AttachmentReplication 에 기대지 않는다 — 캐릭터와 아이템은 서로 다른
+    // 액터 채널이라 도착 순서가 보장되지 않고, 부착이 먼저 오면 그 시점엔 아직
+    // 물리가 켜져 있어 부착이 거부될 수 있다.
+    ApplyCarryState(PreviousHeldActor, false);
+    ApplyCarryState(HeldActor, true);
+
+    const USceneComponent* HeldRoot = IsValid(HeldActor) ? HeldActor->GetRootComponent() : nullptr;
+
+    UE_LOG(LogCarry, Log, TEXT("[클라] OnRep_HeldActor: %s -> %s | 부착 부모=%s"),
+        *GetNameSafe(PreviousHeldActor),
+        *GetNameSafe(HeldActor),
+        HeldRoot ? *GetNameSafe(HeldRoot->GetAttachParent()) : TEXT("(루트 없음/참조 안 풀림)"));
+}
+
+//08.18 추가
+void ABaseCharacter::OnRep_HeavyCarryAssistant()
+{
+	UE_LOG(LogCarry, Log, TEXT("[클라] OnRep_HeavyCarryAssistant: %s"), *GetNameSafe(HeavyCarryAssistant));
+}
+
+void ABaseCharacter::OnRep_AssistingPrimaryCarrier()
+{
+	UE_LOG(LogCarry, Log, TEXT("[클라] OnRep_AssistingPrimaryCarrier: %s"), *GetNameSafe(AssistingPrimaryCarrier));
+}
+
+void ABaseCharacter::Debug_SetCarriedAlly(ABaseCharacter* NewAlly)
+{
+	// 상태 변경은 서버 권한에서만 — 클라가 직접 바꾸면 다음 복제 때 그대로 덮어써진다.
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// 기존에 들고 있던 동료가 있으면 양쪽 상태와 GE를 먼저 정리한다.
+	if (IsValid(CarriedAlly))
+	{
+		CarriedAlly->SetCarrierAlly(nullptr);
+		CarriedAlly->RemoveGameplayEffectFromSelf(CarriedEffectClass);
+		RemoveGameplayEffectFromSelf(CarryingAllyEffectClass);
+	}
+
+	CarriedAlly = NewAlly;
+
+	if (IsValid(NewAlly))
+	{
+		NewAlly->SetCarrierAlly(this);
+		NewAlly->ApplyGameplayEffectToSelf(CarriedEffectClass);
+		ApplyGameplayEffectToSelf(CarryingAllyEffectClass);
+	}
+
+	UE_LOG(LogCarry, Log, TEXT("[서버] Debug_SetCarriedAlly: %s 가 %s 를(을) 들었다."),
+		*GetName(), *GetNameSafe(NewAlly));
+}
+
+void ABaseCharacter::OnRep_CarriedAlly()
+{
+	UE_LOG(LogCarry, Log, TEXT("[클라] OnRep_CarriedAlly: %s 가 지금 들고 있는 대상 = %s"),
+		*GetName(), *GetNameSafe(CarriedAlly));
+}
+
+void ABaseCharacter::OnRep_CarrierAlly()
+{
+	UE_LOG(LogCarry, Log, TEXT("[클라] OnRep_CarrierAlly: %s 를 지금 들고 있는 쪽 = %s"),
+		*GetName(), *GetNameSafe(CarrierAlly));
+}
+
+void ABaseCharacter::TryJump()
+{
+	// [체포 추가] 잠금 중 새 점프 입력을 막는다. 기존 운반·다운 상태 검사와 Jump 호출은 유지한다.
+	if (bMovementLocked) return;
+	if (IsCarryingHeavyItem())
+	{
+		return;
+	}
+
+	if (IsDowned())
+	{
+		return;
+	}
+	Jump();
+}
+
+bool ABaseCharacter::IsCarryingHeavyItem() const
+{
+	// "중량형인가" 는 Loot.Type.Heavy 태그로 판정한다.
+	//
+	// 예전에는 ICarryable::GetWeightClass() 를 봤는데, 노획물 파트가 무게 등급(EWeightClass)을
+	// 없애면서 그 함수도 같이 사라졌다. 지금은 ULootHeavyComponent 가 붙어 있으면
+	// ALootBase 가 이 태그를 단다 — 등급과 배율을 두 번 말하지 않으려는 정리다.
+	//
+	// 태그는 IGameplayTagAssetInterface 로 나온다. ICarryable 이 아니라 이쪽인 이유는
+	// "무엇인가" 와 "어떻게 운반되는가" 를 가른 노획물 쪽 설계를 그대로 따르기 때문이다.
+	if (const IGameplayTagAssetInterface* TagOwner = Cast<const IGameplayTagAssetInterface>(HeldActor))
+	{
+		return TagOwner->HasMatchingGameplayTag(HHTags::Loot_Type_Heavy);
+	}
+
+	return false;
+}
+
+bool ABaseCharacter::IsCarryingLightLoot() const
+{
+	// "Heavy 가 아닌 캐리" 판정 기준을 IsCarryingHeavyItem() 하나로 묶어 둔다 —
+	// HeavyCarryState(enum) 을 따로 보면 판정 기준이 태그 쪽과 두 군데로 갈라진다.
+	return IsValid(HeldActor) && !IsCarryingHeavyItem();
+}
+
+void ABaseCharacter::UpdateHeavyCarryTransform()
+{
+	// HeldActor 는 주 운반자에게만 채워진다(SetHeldActor). 보조자는 AssistingPrimaryCarrier /
+	// AssistedHeavyItem 으로 자신을 추적할 뿐 HeldActor 는 비어 있다 — 그래서 이 가드 하나로
+	// "물건을 실제로 옮길 권한이 있는 쪽"이 자연히 걸러진다. 서버·클라 구분은 필요 없다 —
+	// 모든 머신이 같은 입력으로 같은 결과를 계산하는 결정론적 함수라서 누가 돌려도 같다.
+	if (!IsCarryingHeavyItem() || !IsValid(HeldActor))
+	{
+		return;
+	}
+
+	ALootBase* Loot = Cast<ALootBase>(HeldActor);
+	ULootHeavyComponent* Heavy = HeldActor->FindComponentByClass<ULootHeavyComponent>();
+	ICarryable* Carryable = Cast<ICarryable>(HeldActor);
+	if (!Loot || !Heavy || !Carryable)
+	{
+		return;
+	}
+
+	UPrimitiveComponent* GripRoot = Carryable->GetPhysicsRoot();
+	USkeletalMeshComponent* MyMesh = GetMesh();
+	if (!GripRoot || !MyMesh || !MyMesh->DoesSocketExist(HeavyCarrySocketName))
+	{
+		return;
+	}
+
+	const FName SocketA = Heavy->GetGripSocketA();
+	const FName SocketB = Heavy->GetGripSocketB();
+	if (!GripRoot->DoesSocketExist(SocketA) || !GripRoot->DoesSocketExist(SocketB))
+	{
+		return;
+	}
+
+	const FVector LocalGripA = GripRoot->GetSocketTransform(SocketA, RTS_Component).GetLocation();
+	const FVector LocalGripB = GripRoot->GetSocketTransform(SocketB, RTS_Component).GetLocation();
+	const FVector PrimaryHandWorld = MyMesh->GetSocketLocation(HeavyCarrySocketName);
+
+	// 보조 운반자가 있고, 그쪽 손 소켓도 유효할 때만 2인 캐리로 계산한다.
+	FVector SecondaryHandWorld = FVector::ZeroVector;
+	const bool bHasAssistant = IsValid(HeavyCarryAssistant)
+		&& HeavyCarryAssistant->GetMesh() != nullptr
+		&& HeavyCarryAssistant->GetMesh()->DoesSocketExist(HeavyCarryAssistant->HeavyCarrySocketName);
+	if (bHasAssistant)
+	{
+		SecondaryHandWorld = HeavyCarryAssistant->GetMesh()->GetSocketLocation(HeavyCarryAssistant->HeavyCarrySocketName);
+	}
+
+	const FTransform NewTransform = ALootBase::ComputeHeavyCarryTransform(
+		LocalGripA, LocalGripB, PrimaryHandWorld,
+		bHasAssistant ? &SecondaryHandWorld : nullptr,
+		GetActorForwardVector(),
+		Loot->GetSoloDragPitchDegrees());
+
+	// Kinematic 텔레포트 — 스윕하지 않는다. 물리가 꺼져 있어 스윕해도 밀어낼 대상이
+	// 없고, UpdateNoSocketCarryTransform(일반 노획물의 손 안 든 캐리)도 같은 방식이다.
+	HeldActor->SetActorLocationAndRotation(NewTransform.GetLocation(), NewTransform.GetRotation(), /*bSweep=*/false);
+}
+
+bool ABaseCharacter::IsDowned() const
+{
+	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+	return ASC && ASC->HasMatchingGameplayTag(HHTags::State_Downed);
+}
+
+void ABaseCharacter::SetReviveProgress(float NewProgress)
+{
+	ReviveProgress = FMath::Clamp(NewProgress, 0.f, 1.f);
+}
+
+void ABaseCharacter::OnRep_ReviveProgress()
+{
+	// 지금은 빈 훅 — UI는 나중에 연결한다.
+}
+
+void ABaseCharacter::SetReviveChannelActive(bool bActive)
+{
+	// 권위 판정은 API 안에 둔다 — 서버 전용 호출부(PerformInteraction/EndReviveChannel)가
+	// 실수로라도 클라에서 불릴 일은 없지만, 방어적으로 한 번 더 막는다.
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	bReviveChannelActive = bActive;
+}
+
+void ABaseCharacter::OnRep_ReviveChannelActive()
+{
+	// 시뮬레이티드 프록시(남이 보는 내 모습)는 서버가 리플리케이트하는 몽타주 상태를
+	// 그대로 따라가므로 이 훅이 필요 없다 — 로컬 컨트롤러가 있는 클라이언트 전용이다.
+	if (!IsLocallyControlled())
+	{
+		return;
+	}
+
+	UAbilitySystemComponent* ASC = GetAbilitySystemComponent();
+	if (!ASC)
+	{
+		return;
+	}
+
+	FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromClass(UGAB_Interact::StaticClass());
+	if (!Spec)
+	{
+		return;
+	}
+
+	if (UGAB_Interact* Interact = Cast<UGAB_Interact>(Spec->GetPrimaryInstance()))
+	{
+		Interact->SetLocalHoldState(bReviveChannelActive);
+	}
+}
